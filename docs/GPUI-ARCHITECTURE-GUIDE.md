@@ -10,14 +10,22 @@
 2. [应用启动层](#二应用启动层)
 3. [实体系统与上下文](#三实体系统与上下文)
 4. [窗口管理](#四窗口管理)
+   - [4.1 窗口创建](#41-窗口创建)
+   - [4.2 open_window 内部流程](#42-open_window-内部流程)
+   - [4.3 Window 结构体](#43-window-结构体)
+   - [4.4 持续帧渲染机制](#44-持续帧渲染机制)
 5. [`Render` trait — 声明式 UI 入口](#五render-trait--声明式-ui-入口)
 6. [元素树与样式系统](#六元素树与样式系统)
 7. [事件处理：从点击到重绘](#七事件处理从点击到重绘)
 8. [渲染管线：从元素树到 GPU 像素](#八渲染管线从元素树到-gpu-像素)
+   - [8.1 draw() 帧入口](#81-draw-帧入口)
+   - [8.2 三阶段渲染](#82-三阶段渲染)
+   - [8.3 双缓冲与 present](#83-双缓冲与-present)
 9. [GPU 渲染后端](#九gpu-渲染后端)
 10. [平台抽象层](#十平台抽象层)
 11. [完整数据流总结](#十一完整数据流总结)
 12. [关键源文件索引](#十二关键源文件索引)
+13. [FPS 计数器实战](#十三fps-计数器实战)
 
 ---
 
@@ -204,65 +212,148 @@ impl Context<T> {
 
 ## 四、窗口管理
 
-### 窗口创建
+### 4.1 窗口创建
 
 ```rust
+let bounds = Bounds::centered(None, size(px(400.0), px(300.0)), cx);
+
 cx.open_window(
     WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(bounds)),
-        ..Default::default()
+        ..Default::default()      // 其余选项（标题、焦点策略等）取默认值
     },
-    |_, cx| {
+    |_, cx| {                     // build_root_view 工厂闭包
         cx.new(|_| MyWindow { count: 0 })
     },
-)
+).unwrap();
 ```
 
-### `App::open_window` 内部流程
+**Rust 语法：**
+- `WindowOptions { 字段: 值, ..Default::default() }` — **结构体更新语法**，显式设置部分字段，其余取 `Default` 实现的值
+- `WindowBounds::Windowed(bounds)` — **枚举变体**带数据；`WindowBounds` 有三种：`Windowed(Bounds)`、`Maximized`、`FullScreen`
+- `Some(...)` — `Option` 枚举的 `Some` 变体；`window_bounds` 字段类型是 `Option<WindowBounds>`
+- `.unwrap()` — 如果 `open_window` 返回 `Err` 则程序 panic。生产代码中应使用 `?` 或 `.log_err()`
 
-1. 分配 `WindowId`
-2. 调用 `Window::new()` 创建 `Window` 结构体（约 6300 行代码）
-3. 通过平台层创建原生窗口句柄（`PlatformWindow`）
-4. 执行 `build_root_view` 闭包 → `cx.new()` 创建根视图 `Entity<MyWindow>`
-5. 调用 `draw()` + `clear()` 执行首次完整的布局→绘制→提交管线
-6. 将窗口句柄 `WindowHandle<V>` 注册到 App
+### 4.2 `open_window` 内部流程
 
-### `Window` 结构体
+`App::open_window()`（`crates/gpui/src/app.rs`）执行以下步骤：
+
+```
+┌─────────────────────────────────────────────────┐
+│ 1. 分配 WindowId（唯一窗口标识符）                │
+│                                                  │
+│ 2. Window::new()           ← 创建 Window 结构体  │
+│    ├── TaffyLayoutEngine   ← Flexbox 布局引擎    │
+│    ├── Scene               ← 场景图（绘制命令缓冲）│
+│    ├── FocusHandle         ← 焦点系统            │
+│    ├── WindowInvalidator   ← 脏区域追踪           │
+│    ├── DispatchTree        ← 事件分发树           │
+│    ├── next_frame_callbacks← on_next_frame 队列  │
+│    │   (Rc<RefCell<Vec<FrameCallback>>>)         │
+│    └── next_frame / rendered_frame ← 双缓冲帧    │
+│                                                  │
+│ 3. 平台层创建原生窗口                             │
+│    macOS:  NSWindow + CAMetalLayer               │
+│    Linux:  wl_surface (Wayland) 或 X11 Window    │
+│    Win:    HWND + IDXGISwapChain                 │
+│                                                  │
+│ 4. cx.new() 创建根视图                           │
+│    ├── EntityMap::reserve()  ← 预分配实体槽位    │
+│    ├── EntityMap::insert()  ← Box<dyn Any> 存入  │
+│    └── 返回 Entity<MyWindow> ← 强引用句柄        │
+│                                                  │
+│ 5. draw() → present()  ← 首次渲染到屏幕          │
+│                                                  │
+│ 6. 返回 WindowHandle<MyWindow>                    │
+└─────────────────────────────────────────────────┘
+```
+
+**知识图谱边关系（App → Window 的依赖链）：**
+```
+Application --[contains]--> AppCell --[contains]--> App
+App --[contains]--> Window
+App --[contains]--> EntityMap
+App --[implements]--> AppContext trait
+Window --[contains]--> WindowInvalidator
+Window --[depends_on]--> FocusHandle
+Context<T> --[derefs_to]--> App
+```
+
+### 4.3 `Window` 结构体
 
 `Window`（`crates/gpui/src/window.rs`，6300+ 行）管理完整的渲染生命周期：
 
-| 子系统 | 说明 |
-|--------|------|
-| `element_tree` | 元素树根节点 |
-| `taffy` | `TaffyLayoutEngine` — Flexbox/Grid 布局引擎 |
-| `scene` | `Scene` — 场景图，收集当前帧所有绘制原语 |
-| `focus` | `FocusHandle` / `FocusId` 焦点系统 |
-| `dispatch_tree` | `DispatchTree` — 事件分发树（捕获 + 冒泡） |
-| `hit_test` | `Hitbox` 命中测试 |
-| `invalidator` | `WindowInvalidator` — 脏区域追踪，驱动增量重绘 |
-| `text_system` | `WindowTextSystem` — 窗口级文本塑形 |
-| `input_state` | 鼠标位置、按键状态、修饰键 |
-| `draw_phase` | 当前绘制阶段 |
+| 子系统 | 字段/类型 | 说明 |
+|--------|----------|------|
+| 元素树渲染 | `next_frame`, `rendered_frame` | 双缓冲帧：一帧构建、一帧显示 |
+| 布局引擎 | `taffy: TaffyLayoutEngine` | Flexbox/Grid 布局计算 |
+| 场景图 | `scene: Scene` | 收集当前帧所有绘制原语 |
+| 焦点系统 | `focus: FocusHandle` | 可聚焦元素的焦点管理 |
+| 事件分发 | `dispatch_tree: DispatchTree` | 事件捕获+冒泡分发 |
+| 命中测试 | `hit_test: BoundsTree` | O(log n) 命中区域查找 |
+| 脏追踪 | `invalidator: WindowInvalidator` | 标记需要重绘的区域 |
+| 帧回调 | `next_frame_callbacks` | `on_next_frame`/`request_animation_frame` 注册的闭包 |
+| 文本系统 | `text_system: WindowTextSystem` | 窗口级文本塑形 |
+| 输入状态 | `mouse_position`, `modifiers` | 鼠标位置、按键状态、修饰键 |
+| 绘制阶段 | `draw_phase: DrawPhase` | `None` → `Focus` → `Prepaint` → `Paint` 状态机 |
 
-### 关键子类型
+### 4.4 持续帧渲染机制
+
+GPUI 默认只在状态变更（`cx.notify()`）时渲染。如果需要在无用户操作时也持续渲染（如动画、FPS 显示），使用以下 API：
+
+#### `on_next_frame` — 一次性帧回调
 
 ```rust
-// 焦点管理
-FocusHandle        // 可聚焦元素的句柄，支持 focus()/is_focused()
-WeakFocusHandle    // 弱引用版本
-FocusId            // 焦点元素唯一标识
-
-// 事件分发
-DispatchPhase      // 枚举: Capture(捕获阶段) | Bubble(冒泡阶段)
-DispatchTree       // 事件沿元素树向上/向下传播
-
-// 命中测试
-Hitbox             // 矩形 + content_mask + behavior(Normal/BlockMouse)
-HitboxId           // 唯一命中测试区域标识
-
-// 失效追踪
-WindowInvalidator  // 记录脏视图集合，标记需要重绘的区域
+// Window::on_next_frame 源码 (window.rs:2181)
+pub fn on_next_frame(&self, callback: impl FnOnce(&mut Window, &mut App) + 'static) {
+    RefCell::borrow_mut(&self.next_frame_callbacks).push(Box::new(callback));
+}
 ```
+
+当前帧完成 `present` 后，`next_frame_callbacks` 中的所有闭包被执行，然后队列清空。**每次调用只触发一次。**
+
+#### `request_animation_frame` — 持续帧请求
+
+```rust
+// Window::request_animation_frame 源码 (window.rs:2191)
+pub fn request_animation_frame(&self) {
+    let entity = self.current_view();          // 获取当前活跃的视图实体
+    self.on_next_frame(move |_, cx| cx.notify(entity));
+    //      ↑ 帧完成后 notify 视图 → 标记脏 → 下一帧重新 render
+}
+```
+
+**工作原理：**
+```
+帧 N:
+  render() → layout → prepaint → paint → present(GPU)
+                                           │
+  on_next_frame 回调:                      │
+    cx.notify(entity) ─────────────────────┘
+      │
+      └─ WindowInvalidator 标记脏
+           │
+           帧 N+1:
+             render() → ... → present
+                               │
+             on_next_frame:    │
+               notify ─────────┘
+                 │
+                 帧 N+2: ...   ← 形成无限渲染循环
+```
+
+**使用场景：**
+- FPS 显示（需要在 `render()` 中每帧调用一次）
+- GIF/WebP 动画播放（`img.rs:382` 中每帧推进帧索引）
+- 动画元素（`animation.rs:174` 中驱动缓动进度）
+
+**对比：**
+
+| API | 触发次数 | 用途 |
+|-----|---------|------|
+| `cx.notify()` | 手动调用，标记脏后下一帧渲染 | 状态变更时重绘 |
+| `on_next_frame(cb)` | 一次性，帧完成后执行回调 | 帧完成后的清理/回调逻辑 |
+| `request_animation_frame()` | 内部调用 `on_next_frame` + `notify` | 驱动持续渲染 |
 
 **源文件：** `crates/gpui/src/window.rs` (6302 行)
 
@@ -624,12 +715,48 @@ cx.listener(|this: &mut MyWindow,
 
 ## 八、渲染管线：从元素树到 GPU 像素
 
+### 8.1 `draw()` — 帧的入口
+
+每帧的渲染从 `Window::draw()`（`window.rs:2626`）开始：
+
+```rust
+pub fn draw(&mut self, cx: &mut App) -> ArenaClearNeeded {
+    // 1. 取出并清空帧脏追踪数据
+    let frame_dirty = self.invalidator.take_frame_dirty();
+
+    // 2. 设置元素 Arena（内存池，本帧所有元素在此分配）
+    let _arena_scope = ElementArenaScope::enter(&cx.element_arena);
+
+    // 3. 使过期实体失效，清空上一帧的访问记录
+    self.invalidate_entities();
+    cx.entities.clear_accessed();
+    self.invalidator.set_dirty(false);
+
+    // 4. 渲染所有根视图（你的 render() 在这里被调用！）
+    self.draw_roots(cx);
+
+    // 5. 清空布局引擎、文本系统收尾
+    self.layout_engine.clear();
+    self.text_system().finish_frame();
+    self.next_frame.finish(&mut self.rendered_frame);
+
+    // 6. 双缓冲交换：新帧变成当前帧
+    mem::swap(&mut self.rendered_frame, &mut self.next_frame);
+    self.next_frame.clear();
+
+    // 7. 检查焦点变化、触发 focus_lost_listeners
+    // ...
+}
+```
+
+### 8.2 三阶段渲染
+
 每帧渲染的完整流程（`Element` trait 三阶段）：
 
-### 阶段 1：`Render` trait — 重建元素树
+#### 阶段 1：`Render` trait — 重建元素树
 
 ```
-你的 render() 被调用
+你的 render() 被调用（在 draw_roots 中）
   ↓ 返回新的元素树
 div()
   ├── div(text: "Count: 3")
@@ -638,7 +765,7 @@ div()
        └── div("Decrement") + on_click
 ```
 
-### 阶段 2：`request_layout` — Taffy Flexbox 布局
+#### 阶段 2：`request_layout` — Taffy Flexbox 布局
 
 ```
 元素树
@@ -646,20 +773,20 @@ div()
 ┌──────────────────────────────────────┐
 │ TaffyLayoutEngine                     │
 │                                       │
-│ 1. 将 GPUI Style 转换为 Taffy 样式    │
+│ 1. GPUI Style → Taffy 样式节点       │
 │ 2. 构建 Taffy Tree（flexbox 节点树）  │
-│ 3. 执行 flexbox 布局计算               │
-│    - 计算每个元素的最小/最大尺寸        │
-│    - 根据 flex_direction/gap/align     │
-│      确定最终位置 (x, y)               │
-│    - 处理 flex_grow/flex_shrink        │
-│ 4. 像素对齐（pixel snapping）          │
-│    → 确保边缘对齐像素网格，避免模糊     │
+│ 3. compute_layout()：                 │
+│    - 计算每个元素的最小/最大尺寸      │
+│    - 根据 flex_direction/gap/align    │
+│      确定最终 (x, y, width, height)   │
+│    - 处理 flex_grow/flex_shrink       │
+│ 4. 像素对齐（pixel snapping）         │
+│    → 确保边缘对齐像素网格，避免模糊   │
 └──────────────────────────────────────┘
   ↓ 得到每个元素的 Bounds<Pixels>
 ```
 
-### 阶段 3：`prepaint` — 构建 Scene 场景图
+#### 阶段 3：`prepaint` — 构建 Scene 场景图
 
 ```
 每个元素（已知 Bounds<Pixel>）
@@ -669,8 +796,7 @@ div()
 │                                       │
 │ shadows[]                             │
 │   Shadow { blur_radius, bounds,       │
-│            color, corner_radii,       │
-│            inset, element_bounds }    │
+│            color, corner_radii }      │
 │                                       │
 │ quads[]                               │
 │   Quad { draw_order, bounds,          │
@@ -684,18 +810,14 @@ div()
 │   Underline { bounds, color, style }  │
 │                                       │
 │ sprites[]                             │
-│   MonochromeSprite { bounds, color,   │
-│       tile, transformation }          │
-│   PolychromeSprite { grayscale,       │
-│       opacity, bounds, tile }         │
-│   SubpixelSprite { ... }              │
+│   MonochromeSprite/PolychromeSprite   │
 │                                       │
 │ surfaces[] (macOS only)               │
-│   PaintSurface { CVPixelBuffer }    │
+│   PaintSurface { CVPixelBuffer }      │
 └──────────────────────────────────────┘
 ```
 
-### 阶段 4：`paint` — 排序并提交 GPU
+#### 阶段 4：`paint` — 排序并提交 GPU
 
 ```
 Scene 中的所有绘制原语
@@ -710,22 +832,53 @@ Scene 中的所有绘制原语
 │ paths: Vec<Path>                      │
 │ underlines: Vec<Underline>            │
 │ monochrome_sprites: Batch             │
-│ subpixel_sprites: Batch               │
 │ polychrome_sprites: Batch             │
 │ surfaces: Vec<PaintSurface>           │
 └────────────────┬─────────────────────┘
                  ↓
 ┌──────────────────────────────────────┐
-│ 平台渲染器                             │
-│   MetalRenderer / DirectXRenderer /   │
-│   WgpuRenderer                        │
+│ PlatformWindow::present()             │
 │                                       │
-│ 1. 上传纹理到 GPU                       │
-│ 2. 绑定 shader 管线                     │
-│ 3. 提交绘制命令                         │
-│ 4. Present（交换缓冲区到屏幕）           │
+│ macOS: CAMetalLayer.drawable          │
+│   → CommandBuffer.commit()            │
+│   → drawable.present()                │
+│                                       │
+│ Linux: wgpu Surface                   │
+│   → Queue.submit()                    │
+│   → Surface.present()                 │
+│                                       │
+│ Windows: IDXGISwapChain               │
+│   → SwapChain.Present(1, 0)           │
 └──────────────────────────────────────┘
 ```
+
+### 8.3 双缓冲与 `present`
+
+GPUI 使用双缓冲帧机制：
+
+```
+Window {
+    next_frame: Frame,         // 当前正在构建的帧
+    rendered_frame: Frame,     // 上一帧（已显示在屏幕上）
+}
+
+draw() 流程:
+  1. next_frame 中构建新帧（layout → prepaint → paint）
+  2. mem::swap(next_frame, rendered_frame)  // 交换
+  3. 旧 rendered_frame（现在在 next_frame）被 clear() 清空
+  4. 新 rendered_frame（刚构建的）等待 present
+```
+
+**`present` 后触发 `next_frame_callbacks`：**
+```rust
+// window.rs:1507 附近
+let next_frame_callbacks = next_frame_callbacks.take();
+for callback in next_frame_callbacks {
+    callback(window, cx);
+}
+```
+
+这就是 `request_animation_frame` 注册的回调被执行的地方。
 
 ### `Drawable` — 元素状态机
 
@@ -748,6 +901,7 @@ enum DrawableState {
 - `crates/gpui/src/taffy.rs` (751 行) — `TaffyLayoutEngine`
 - `crates/gpui/src/geometry.rs` (3996 行) — 几何类型（`Point`/`Size`/`Bounds`/`Edges`）
 - `crates/gpui/src/bounds_tree.rs` (472 行) — 命中测试 R-tree
+- `crates/gpui/src/window.rs` (6302 行) — `draw()`、`present()`、双缓冲
 
 ---
 
@@ -1104,72 +1258,110 @@ main()
 
 ---
 
-## 附录：`my_gpui_app` 计数器示例完整注释
+## 十三、FPS 计数器实战
+
+在基础计数器上添加实时 FPS 显示。完整代码：
 
 ```rust
 use gpui::{
-    // 核心类型
-    App,                     // 应用全局状态
-    Context,                 // 实体上下文（提供 notify/observe/listener 等）
-    Window,                  // 窗口管理
-    WindowBounds,           // 窗口边界（普通窗口/最大化/全屏）
-    WindowOptions,          // 窗口创建配置
-    // 元素构建
-    div,                     // div() — GPUI 的核心容器元素
-    prelude::*,              // 导入常用 trait（Render、Styled、IntoElement 等）
-    // 工具函数
-    px,                      // px(400.0) — 创建 Pixels 单位
-    rgb,                     // rgb(0x2e2e2e) — 创建 RGB 颜色
-    size,                    // size(w, h) — 创建 Size 对象
+    App, Bounds, Context, Window, WindowBounds, WindowOptions,
+    div, prelude::*, px, rgb, size,
 };
-use gpui_platform::application;  // 平台特定的 Application 工厂
+use gpui_platform::application;
+use std::time::Instant;              // ← Rust 标准库的单调时钟
 
-/// 窗口组件的状态
 struct MyWindow {
-    count: i32,              // 唯一的可变状态：当前计数
+    count: i32,
+
+    // -------- FPS 计数字段 --------
+    fps: f64,                         // 当前帧率显示值
+    last_frame: Instant,              // 上一次 render 的时间戳
+    frame_count: u64,                 // 累积帧数
+    accumulated_time: f64,            // 累积时间（秒）
 }
 
-/// 实现 Render trait —— GPUI 的声明式 UI 入口
-/// 类似 React 组件的 render() 函数
 impl Render for MyWindow {
     fn render(
-        &mut self,           // &mut self — 读取组件状态（self.count）
-        _window: &mut Window, // 窗口句柄（用于焦点、动作分发）
-        cx: &mut Context<Self>, // 上下文（用于 cx.listener / cx.notify）
-    ) -> impl IntoElement {   // 返回任何可转为 Element 的类型
-        div()                 // 创建 Div 元素 ← GPUI 的 "万能容器"
-            .flex()           // display: flex
-            .flex_col()       // flex-direction: column（垂直排列）
-            .gap_4()          // gap: 1rem（子元素间距 4 单位）
-            .bg(rgb(0x2e2e2e)) // background-color: #2E2E2E
-            .size_full()      // width:100%; height:100%
-            .justify_center() // justify-content: center（垂直居中）
-            .items_center()   // align-items: center（水平居中）
-            .text_color(rgb(0xffffff)) // color: white
-            .child(           // 添加子元素 ↑↑↑
+        &mut self,                    // &mut self — 可以读取和修改所有字段
+        window: &mut Window,          // 窗口句柄
+        cx: &mut Context<Self>,       // 上下文
+    ) -> impl IntoElement {
+
+        // ======== 帧率计算 ========
+
+        // Instant::now() — 获取当前时间点（单调时钟，不受系统时间调整影响）
+        let now = Instant::now();
+
+        // duration_since(earlier) → Duration
+        // .as_secs_f64() → 转换为 f64 秒数（浮点，可做除法）
+        let delta = now.duration_since(self.last_frame).as_secs_f64();
+        self.last_frame = now;
+        self.frame_count += 1;        // u64 += 1，累计帧数
+
+        self.accumulated_time += delta;
+
+        // 每 0.5 秒刷新一次 FPS 显示值
+        // 不每帧刷新是为了避免数字跳太快看不清
+        if self.accumulated_time >= 0.5 {
+            // as f64 — Rust 的显式类型转换
+            // u64 ÷ f64 = f64（自动提升）
+            self.fps = self.frame_count as f64 / self.accumulated_time;
+
+            // 重置计数器
+            self.frame_count = 0;
+            self.accumulated_time = 0.0;
+        }
+
+        // ======== 请求持续渲染 ========
+        //
+        // 不调用这行的话，render() 仅在 cx.notify() 被调用时才执行
+        // 有了它，GPUI 在每帧完成后自动安排下一帧 → FPS 持续更新
+        window.request_animation_frame();
+        // 内部实现：
+        //   let entity = self.current_view();
+        //   self.on_next_frame(move |_, cx| cx.notify(entity));
+
+        // ======== UI ========
+        div()
+            .flex()
+            .flex_col()
+            .gap_4()
+            .bg(rgb(0x2e2e2e))
+            .size_full()
+            .justify_center()
+            .items_center()
+            .text_color(rgb(0xffffff))
+            .child(
                 div()
-                    .text_2xl()
+                    .text_3xl()
                     .font_weight(gpui::FontWeight::BOLD)
-                    .child(format!("Count: {}", self.count)), // 显示当前计数
+                    .child(format!("Count: {}", self.count)),
+            )
+            .child(
+                // FPS 显示
+                div()
+                    .text_sm()
+                    .text_color(rgb(0x888888))
+                    // format!("FPS: {:.0}", self.fps) — 保留 0 位小数
+                    .child(format!("FPS: {:.0}", self.fps)),
             )
             .child(
                 div()
-                    .flex()   // 水平排列按钮
+                    .flex()
                     .gap_2()
                     .child(
                         div()
-                            .id("increment")   // 分配 DOM 级 ID（测试用）
-                            .px_4()            // padding-left + right: 4 单位
-                            .py_2()            // padding-top + bottom: 2 单位
-                            .bg(rgb(0x007acc)) // 蓝色背景
-                            .rounded_md()      // border-radius: 中等圆角
-                            .cursor_pointer()  // 鼠标悬停显示手型
+                            .id("increment")
+                            .px_4()
+                            .py_2()
+                            .bg(rgb(0x007acc))
+                            .rounded_md()
+                            .cursor_pointer()
                             .child("Increment")
-                            // ← 关键：注册点击事件
                             .on_click(cx.listener(
                                 |this, _event, _, cx| {
-                                    this.count += 1;  // 修改状态
-                                    cx.notify();      // 通知 GPUI 重绘
+                                    this.count += 1;
+                                    cx.notify();
                                 },
                             )),
                     )
@@ -1178,7 +1370,7 @@ impl Render for MyWindow {
                             .id("decrement")
                             .px_4()
                             .py_2()
-                            .bg(rgb(0xcc3333)) // 红色背景
+                            .bg(rgb(0xcc3333))
                             .rounded_md()
                             .cursor_pointer()
                             .child("Decrement")
@@ -1194,25 +1386,142 @@ impl Render for MyWindow {
 }
 
 fn main() {
-    // 1. 启动平台层事件循环
     application().run(|cx: &mut App| {
-        // 2. 计算窗口位置：屏幕居中，400×300 像素
         let bounds = Bounds::centered(None, size(px(400.0), px(300.0)), cx);
-
-        // 3. 打开操作系统窗口
         cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
-                ..Default::default()  // 其余选项用默认值
+                ..Default::default()
             },
-            // 4. 创建根视图（Entity<MyWindow>）
             |_, cx| {
-                cx.new(|_| MyWindow { count: 0 })
+                cx.new(|_| MyWindow {
+                    count: 0,
+                    fps: 0.0,
+                    last_frame: Instant::now(),       // 初始时间戳
+                    frame_count: 0,
+                    accumulated_time: 0.0,
+                })
             },
         )
         .unwrap();
+        cx.activate(true);
+    });
+}
+```
 
-        // 5. 激活窗口（聚焦 + 提升到最前）
+**FPS 计算原理：**
+
+```
+render() 被调用
+  │
+  ├─ Instant::now() → 获取时间戳 Tn
+  ├─ delta = Tn - Tn-1（帧间隔秒数）
+  ├─ 累积 frame_count 和 accumulated_time
+  │
+  └─ 每 0.5 秒:
+       fps = frame_count / accumulated_time
+       （例如 30 帧 / 0.5 秒 = 60 FPS）
+       重置计数器
+```
+
+**Rust 新语法：**
+- `use std::time::Instant` — 导入标准库的单调时钟
+- `Instant::now()` — 关联函数，获取当前时刻
+- `duration_since(earlier)` → `Duration` — 计算时间差
+- `.as_secs_f64()` — `Duration` 转 `f64` 秒
+- `self.frame_count as f64` — `as` 运算符：`u64` → `f64` 显式转换
+
+**关键 API：**
+- `window.request_animation_frame()` — 帧完成后自动安排下一帧渲染
+- 不调用则只在 `cx.notify()` 时渲染，FPS 显示会"冻住"
+
+---
+
+## 附录：原版计数器示例完整注释
+
+```rust
+use gpui::{
+    App, Bounds, Context, Window, WindowBounds, WindowOptions,
+    div, prelude::*, px, rgb, size,
+};
+use gpui_platform::application;
+
+struct MyWindow {
+    count: i32,
+}
+
+impl Render for MyWindow {
+    fn render(
+        &mut self,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        div()
+            .flex()
+            .flex_col()
+            .gap_4()
+            .bg(rgb(0x2e2e2e))
+            .size_full()
+            .justify_center()
+            .items_center()
+            .text_color(rgb(0xffffff))
+            .child(
+                div()
+                    .text_3xl()
+                    .font_weight(gpui::FontWeight::BOLD)
+                    .child(format!("Count: {}", self.count)),
+            )
+            .child(
+                div()
+                    .flex()
+                    .gap_2()
+                    .child(
+                        div()
+                            .id("increment")
+                            .px_4()
+                            .py_2()
+                            .bg(rgb(0x007acc))
+                            .rounded_md()
+                            .cursor_pointer()
+                            .child("Increment")
+                            .on_click(cx.listener(
+                                |this, _event, _, cx| {
+                                    this.count += 1;
+                                    cx.notify();
+                                },
+                            )),
+                    )
+                    .child(
+                        div()
+                            .id("decrement")
+                            .px_4()
+                            .py_2()
+                            .bg(rgb(0xcc3333))
+                            .rounded_md()
+                            .cursor_pointer()
+                            .child("Decrement")
+                            .on_click(cx.listener(
+                                |this, _event, _, cx| {
+                                    this.count -= 1;
+                                    cx.notify();
+                                },
+                            )),
+                    ),
+            )
+    }
+}
+
+fn main() {
+    application().run(|cx: &mut App| {
+        let bounds = Bounds::centered(None, size(px(400.0), px(300.0)), cx);
+        cx.open_window(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(bounds)),
+                ..Default::default()
+            },
+            |_, cx| cx.new(|_| MyWindow { count: 0 }),
+        )
+        .unwrap();
         cx.activate(true);
     });
 }
@@ -1221,3 +1530,5 @@ fn main() {
 ---
 
 > 本文档由 `/understand` 知识图谱分析生成，基于 `zed` 仓库 `cc3d4d58` 提交版本。
+> 包含 FPS 计数器实战、持续帧渲染机制（`request_animation_frame`/`on_next_frame`）、
+> `draw()`/`present()` 双缓冲渲染管线、以及面向 Rust 初学者的语法注解。

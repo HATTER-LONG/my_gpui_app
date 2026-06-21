@@ -1,0 +1,24 @@
+[
+  {
+    "label": "Debug Gpui App (CodeLLDB)",
+    "adapter": "CodeLLDB",
+    "cwd": "/home/layton/workspace/zed_team/my_gpui_app",
+    "build": {
+      "label": "Build Gpui App",
+      "command": "cargo",
+      "args": ["build"],
+      "cwd": "/home/layton/workspace/zed_team/my_gpui_app",
+    },
+  },
+  {
+    "label": "Debug Gpui App (GDB)",
+    "adapter": "GDB",
+    "cwd": "/home/layton/workspace/zed_team/my_gpui_app",
+    "build": {
+      "label": "Build Gpui App",
+      "command": "cargo",
+      "args": ["build"],
+      "cwd": "/home/layton/workspace/zed_team/my_gpui_app",
+    },
+  },
+]

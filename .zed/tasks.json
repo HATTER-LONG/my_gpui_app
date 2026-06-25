@@ -1,0 +1,9 @@
+[
+  {
+    "label": "cargo run",
+    "command": "cargo",
+    "args": ["run"],
+    "allow_concurrent_runs": true,
+    "use_new_terminal": false,
+  },
+]

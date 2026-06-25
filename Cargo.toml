@@ -6,3 +6,5 @@ edition = "2024"
 [dependencies]
 gpui = { path = "../zed/crates/gpui" }
 gpui_platform = { path = "../zed/crates/gpui_platform", features = ["wayland"] }
+
+gpui-component = { path = "../gpui-component/crates/ui" }

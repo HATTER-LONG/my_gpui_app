@@ -1,5 +1,5 @@
 use gpui::{prelude::*, Context, Window, div};
-use gpui_component::button::Button;
+use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::label::Label;
 use gpui_component::ActiveTheme as _;
 use std::time::Instant;
@@ -51,22 +51,19 @@ impl Render for ComponentCounterView {
             .rounded_md()
             .bg(cx.theme().background)
             .child(
-                Label::new("comp-title")
+                Label::new("Component")
                     .text_xl()
-                    .font_weight(gpui::FontWeight::BOLD)
-                    .child("Component"),
+                    .font_weight(gpui::FontWeight::BOLD),
             )
             .child(
-                Label::new("comp-count")
+                Label::new(format!("Count: {}", self.count))
                     .text_3xl()
-                    .font_weight(gpui::FontWeight::BOLD)
-                    .child(format!("Count: {}", self.count)),
+                    .font_weight(gpui::FontWeight::BOLD),
             )
             .child(
-                Label::new("comp-fps")
+                Label::new(format!("FPS: {:.0}", self.fps))
                     .text_sm()
-                    .text_color(cx.theme().muted)
-                    .child(format!("FPS: {:.0}", self.fps)),
+                    .text_color(cx.theme().muted),
             )
             .child(
                 div()

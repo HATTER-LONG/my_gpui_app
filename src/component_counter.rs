@@ -1,7 +1,7 @@
-use gpui::{prelude::*, Context, Window, div};
+use gpui::{Context, Window, div, prelude::*};
+use gpui_component::ActiveTheme as _;
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::label::Label;
-use gpui_component::ActiveTheme as _;
 use std::time::Instant;
 
 pub struct ComponentCounterView {
@@ -63,7 +63,7 @@ impl Render for ComponentCounterView {
             .child(
                 Label::new(format!("FPS: {:.0}", self.fps))
                     .text_sm()
-                    .text_color(cx.theme().muted),
+                    .text_color(cx.theme().blue),
             )
             .child(
                 div()
